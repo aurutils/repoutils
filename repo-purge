@@ -1,0 +1,424 @@
+#!/usr/bin/env perl
+#requires pacman-contrib pacutils pacman
+use strict;
+use warnings;
+
+use Cwd 'abs_path';
+use File::Basename;
+use File::Copy;
+use File::Find;
+use File::Temp 'tempfile';
+
+use Getopt::Long;
+my $argv0 = basename($0);
+my $opt_d = 0;
+my $opt_h = 0;
+my $opt_f = "";
+my $opt_t = "";
+my $opt_s = 0;
+my $opt_c = "/etc/pacman.conf";
+my $opt_a = 0;
+my $opt_m = 0;
+my $opt_R = 0;
+
+sub usage() {
+    if ($opt_a == 1) {
+        print STDERR "Usage: $argv0 [-t to] package [package...]\n";
+    } elsif ($opt_m == 1) {
+        print STDERR "Usage: $argv0 [-f from] [-t to] pkgname [pkgname...]\n";
+    } elsif ($opt_R == 1) {
+        print STDERR "Usage: $argv0 [-f from]\n";
+    } else {
+        print STDERR <<"EOF";
+Usage: $argv0 [--dry] [-f from...] pkgname [pkgname...]
+       $argv0 --move [-f from] [-t to] pkgname [pkgname...]
+       $argv0 --add [-t to] package [package...]
+       $argv0 --reset [-f from]
+EOF
+    }
+    exit(1);
+}
+
+# XXX expose repo-add -n/-p (--add)
+#     use modes as $1 (git) instead of mode options or basename $0
+#     allow to specify local repo path directly (--root <from> --root <to>)
+#     allow options to append to arrays where appropriate (--from A --from B)
+#     allow adding package in repository root with only pkgname (add/addpkg)
+#     remove: add option to only remove database entries (cf. repo-remove normal operation)?
+#     add package/global state for counter of (successful) repo-add commands
+GetOptions('dryrun|print' => \$opt_d,
+           'f|from=s' => \$opt_f,
+           'h|help' => \$opt_h,
+           't|to=s' => \$opt_t,
+           's|sync' => \$opt_s,
+           'c|config=s' => \$opt_c,
+           'a|add' => \$opt_a,
+           'm|move' => \$opt_m,
+           'R|reset' => \$opt_R)
+    or usage();
+
+usage()
+    if ($opt_h == 1);
+$opt_a = 1 if ($argv0 eq "repo-addpkg");
+$opt_m = 1 if ($argv0 eq "repo-move");
+$opt_R = 1 if ($argv0 eq "repo-reset");
+
+# XXX -t invalid option for aur-remove? (possible confusion with -f)
+if (length($opt_t) == 0 && $opt_a) {
+    print STDERR "$argv0: --add requires a target (-t) repository\n";
+    usage();
+} elsif (length($opt_f) == 0 && $opt_R) {
+    print STDERR "$argv0: --reset requires a source (-f) repository\n";
+    usage();
+} elsif ((length($opt_t) == 0 || length($opt_f) == 0) && $opt_m == 1) {
+    print STDERR "$argv0: --move requires both a source (-f) and target (-t) repository\n";
+    usage();
+} elsif (($opt_t eq $opt_f) && $opt_m == 1) {
+    print STDERR "$argv0: --move requires different source (-f) and target (-t) repositories\n";
+    usage();
+} elsif (not -e $opt_c) {
+    print STDERR "$opt_c: file is not readable\n";
+    exit(1);
+}
+
+# https://metacpan.org/source/ZMIJ/Array-Utils-0.5/Utils.pm
+sub array_minus(\@\@) {
+    my %e = map{ $_ => undef } @{$_[1]};
+    return grep( ! exists( $e{$_} ), @{$_[0]} ); 
+}
+
+sub local_repo_path($) {
+    my $repo = $_[0];
+    my $pacman_conf = $opt_c;
+
+    my @list = `pacconf --config=$pacman_conf --repo=$repo Server`
+        or die "pacconf: $!";
+    my @paths;
+    chomp(@list);
+
+    for my $serv(@list) {
+        if ($serv =~ /^file:\/\//) {
+            $serv =~ s/file:\/\///;
+            push(@paths, $serv . "/" . $repo . ".db");
+        }
+    }
+    return @paths;
+}
+
+sub local_repo_list() {
+    my $pacman_conf = $opt_c;
+
+    my @list = `pacconf --config=$pacman_conf --repo-list`
+        or die "pacconf: $!";
+    my @list_local;
+    chomp @list;
+
+    for my $repo(@list) {
+        my @paths = local_repo_path($repo);
+        chomp @paths;
+
+        for my $path(@paths) {
+            push(@list_local, $path);
+        }
+    }
+    return @list_local;
+}
+
+sub run_command(\@) {
+    my @command = @{$_[0]};
+
+    if (system(@command) != 0) {
+        my $exit = $? >> 8;
+        warn("warning: " . join(" ", @command) . " failed with status $exit");
+
+        return undef;
+    }
+    return 1;
+}
+
+# PKGBUILD(5)
+my $pkgspec = qr/((?=[^\-\.])[\w\-@\.\+]+)\-(\d:)?([^:\/\-\s]+)\-(\d+(\.\d+)?)/;
+my $pkgfile = qr/${pkgspec}\-(\w+)(\.pkg\.tar)(\.\w+)?/;
+
+if ($#ARGV < 0 && not $opt_R) {
+    print STDERR "$argv0: requires at least one package name\n";
+    usage();
+}
+
+# Working variables
+my %packages;
+my %removals;
+my @repo_list;
+my @move_list;
+my %to_sync;
+
+if (length($opt_t) > 1) {
+    @move_list = local_repo_path($opt_t);
+}
+if (length($opt_f) > 1) {
+    @repo_list = local_repo_path($opt_f);
+} else {
+    @repo_list = local_repo_list();
+}
+
+chomp @repo_list;
+chomp @move_list;
+
+die 'no file:// repository found (-f)'
+    unless scalar(@repo_list) > 0;
+die 'no file:// repository found (-t)'
+    unless scalar(@move_list) > 0 or $opt_t eq "";
+
+if ($opt_a == 1) {
+    my @add_list;
+    my @add_nval;
+
+    for my $arg (@ARGV) {
+        if ($arg =~ /${pkgfile}$/ && (-f $arg)) {
+            push(@add_list, $arg);
+        } else {
+            print STDERR "invalid package: $arg\n";
+            push(@add_nval, $arg);
+        }
+    }
+    my $db_name = basename($move_list[0], ".db");
+    $to_sync{$db_name} = 0;
+
+    if (scalar(@add_nval) > 0) {
+        warn("warning: invalid packages specified, ignoring");
+    } else {
+        my $abs_path_t = abs_path($move_list[0]);
+        my @targets;
+
+        # XXX Support adding a package to multiple repositories?
+        #     repo-add can take multiple arguments
+        for my $pkg (@add_list) {
+            my $move_target = dirname($move_list[0]);
+            my @cmd = ('repo-add', $abs_path_t, $move_target . "/" . $pkg);
+
+            if ($opt_d == 0 && move($pkg, $move_target)) {
+                if (run_command(@cmd)) {
+                    $to_sync{$db_name}++;
+                }
+            } elsif ($opt_d == 0) {
+                warn("warning: could not move $pkg to $move_target\n");
+                warn("warning: repo-add was not run for $pkg\n");
+            } elsif ($opt_d == 1) {
+                print("[DRY] mv $pkg " . $move_target . "\n");
+                print("[DRY] " . join(" ", @cmd) . "\n");
+                $to_sync{$db_name}++;
+            }
+        }
+    }
+} elsif ($opt_R == 1) {
+    # Remove the database and create a new copy with newest (vercmp) packages
+    my %candidates;
+
+    # XXX support multiple repositories
+    find(sub {
+        my @match = ($_ =~ /${pkgfile}$/);
+
+        if (scalar(@match) > 0) {
+            $candidates{$File::Find::name} = $match[0];
+        } else {
+            return;
+        }
+    }, dirname($repo_list[0]));
+
+    my @sorted;
+    my %names;
+    my @targets;
+
+    if (scalar(keys %candidates) > 0) {
+        my ($fh, $filename) = tempfile();
+        for my $pkg(keys %candidates) {
+            print $fh "$pkg\n";
+        }
+        @sorted = `pacsort -r $filename` or die "pacsort: $!";
+        close($fh);
+
+        chomp(@sorted);
+        for my $pkg(@sorted) {
+            my $name = $candidates{$pkg};
+
+            push(@targets, $pkg)
+                unless exists $names{$name};
+            $names{$name} = 1;
+        }
+    } else {
+        warn("warning: no packages found, running repo-add without package arguments");
+    }
+    my $path = $repo_list[0];
+    my $abs_path = abs_path($path);
+
+    if ($path eq $abs_path) {
+        warn("warning: could not resolve symbolic link, assuming .tar.gz");
+        $abs_path = "$path.tar.gz";
+    }
+
+    if ($opt_d == 0) {
+        if (-f $abs_path && unlink $abs_path) {
+            print("unlinked $abs_path\n");
+        } elsif (-f $abs_path) {
+            warn("warning: could not unlink $abs_path\n");
+        }
+
+        my @cmd = ('repo-add', $abs_path);
+        push(@cmd, @targets);
+        if (run_command(@cmd)) {
+            $to_sync{basename($repo_list[0], ".db")}++;
+        }
+    } elsif ($opt_d == 1) {
+        $to_sync{basename($repo_list[0], ".db")}++;
+
+        print("[DRY] unlink $abs_path\n") if -f $abs_path;
+        print("[DRY] repo-add $abs_path " . join(" ", @targets) . "\n");
+    }
+} else { # XXX "default" remove mode
+    for my $repo(@repo_list) {
+        my @contents = `tar -tf $repo --exclude='*/*'`;
+        my $db_name = basename($repo, ".db");
+        chomp @contents;
+
+        for my $entry(@contents) {
+            $entry =~ s/\/$//; # remove trailing backslash
+
+            for my $needle(@ARGV) {
+                if ($entry =~ /${pkgspec}$/ && $1 eq $needle) {
+                    push(@{$removals{$needle}}, $repo);
+                    $to_sync{$db_name} = 0;
+                }
+            }
+        }
+        find(sub {
+            return unless -f;
+
+            for my $needle(@ARGV) {
+                if ($_ =~ /${pkgfile}$/ && $1 eq $needle) {
+                    push(@{$packages{$needle}}, $File::Find::name); # store full path
+                }
+            }
+        }, dirname($repo));
+    }
+    my @keys_r = keys %removals;
+    my @keys_p = keys %packages;
+
+    for(array_minus(@ARGV, @keys_r)) {
+        warn("warning: $_ not found in database\n");
+    }
+    for(array_minus(@ARGV, @keys_p)) {
+        warn("warning: $_ not found in cache\n");
+    }
+
+    # disk updates
+    for my $name(@keys_p) {
+        for my $file(@{$packages{$name}}) {
+            if ($opt_m == 1) {
+                # XXX move to multiple repositories?
+                my $move_target = dirname($move_list[0]);
+
+                if ($opt_d == 0 && move($file, $move_target)) {
+                    print("moved $file to " . $move_target . "\n");
+                } elsif ($opt_d == 0) {
+                    warn("warning: could not move $file to $move_target\n");
+                } elsif ($opt_d == 1) {
+                    print("[DRY] mv $file " . dirname($move_list[0]) . "\n");
+                }
+            } elsif ($opt_d == 0 && unlink $file) {
+                print("unlinked $file\n");
+            } elsif ($opt_d == 0) {
+                warn("warning: could not unlink $file\n");
+            } elsif ($opt_d == 1) {
+                print("[DRY] unlink $file\n");
+            }
+        }
+    }
+
+    # database updates
+    for my $name(@keys_r) {
+        for my $path_f(@{$removals{$name}}) {
+            my $abs_path_f = abs_path($path_f); # resolve symbolic link
+
+            if ($opt_m == 1) {
+                my $target_pkg;
+                my @packages;
+
+                if (defined $packages{$name}) {
+                    @packages = @{$packages{$name}};
+                } else {
+                    die "error: package list empty";
+                }
+
+                if (scalar(@packages) > 1) {
+                    my ($fh, $filename) = tempfile();
+                    print $fh join("\n", @packages);
+
+                    my @sorted_pkg = `pacsort -r $filename` or die "pacsort: $!";
+                    chomp(@sorted_pkg);
+
+                    close($fh);
+                    $target_pkg = basename($sorted_pkg[0]);
+                } else {
+                    $target_pkg = basename($packages[0]);
+                }
+                my $abs_path_t = abs_path($move_list[0]);
+                my $new_path = dirname($move_list[0]) . "/" . $target_pkg;
+                my @cmd_add = ('repo-add', $abs_path_t, $new_path);
+                my @cmd_rmv = ('repo-remove', $abs_path_f, $name);
+
+                # XXX repo-add can take multiple arguments
+                if ($opt_d == 0 && (-f $new_path)) {
+                    if (run_command(@cmd_add)) {
+                        $to_sync{basename($move_list[0], ".db")}++;
+                    }
+                    if (run_command(@cmd_rmv)) {
+                        $to_sync{basename($path_f, ".db")}++;
+                    }
+                } elsif ($opt_d == 0) {
+                    warn("warning: could not find move target $new_path");
+                } elsif ($opt_d == 1) {
+                    print("[DRY] repo-add $abs_path_t $new_path\n");
+                    print("[DRY] repo-remove $abs_path_f $name\n");
+
+                    $to_sync{basename($move_list[0], ".db")}++;
+                    $to_sync{basename($path_f, ".db")}++;
+                }
+            } elsif ($opt_d == 0) { # XXX "default" mode remove
+                my @cmd_rmv = ('repo-remove', $abs_path_f, $name);
+
+                if (run_command(@cmd_rmv)) {
+                    $to_sync{basename($path_f, ".db")}++;
+                }
+            } elsif ($opt_d == 1) {
+                print("[DRY] repo-remove $abs_path_f $name\n");
+                $to_sync{basename($path_f, ".db")}++;
+            }
+        }
+    }
+}
+
+my @keys_s;
+for my $k(keys %to_sync) {
+    if ($to_sync{$k} == 0) {
+        warn("warning: failed to modify database '$k', ignoring for sync");
+    } else {
+        push(@keys_s, $k);
+    }
+}
+
+if ($opt_s == 1 && $opt_d == 0) {
+    my @cmd = ('sudo', 'pacsync');
+    push(@cmd, @keys_s);
+
+    if (scalar(@keys_s) > 0) {
+        run_command(@cmd);
+    }
+} elsif ($opt_s == 1 && $opt_d == 1) {
+    if (scalar(@keys_s) > 0) {
+        print("[DRY] sudo pacsync " . join(" ", @keys_s) . "\n");
+    }
+} elsif ($opt_s == 0 && $opt_d == 0) {
+    for my $k(@keys_s) {
+        print("note: database modified, run 'pacsync $k' to update\n");
+    }
+}
