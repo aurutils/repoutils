@@ -5,4 +5,4 @@ BINDIR ?= $(PREFIX)/bin
 .PHONY: install
 
 install:
-	@install -Dm755 repo-* -t $(DESTDIR)$(BINDIR)'
+	@install -Dm755 repo-* -t '$(DESTDIR)$(BINDIR)'
