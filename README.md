@@ -1,2 +1,2 @@
-Visualisation of PKGBUILD(5) regexp ([jex.im](https://jex.im))
+Visualisation of PKGBUILD(5) pcre
 ![pkgspec](pkgspec.png)
