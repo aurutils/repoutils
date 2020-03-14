@@ -1,6 +1,6 @@
 # Maintainer: Alad Wenter <https://github.com/AladW>
 pkgname=repoutils-git
-pkgver=2.3.1.r114.g90e4b42
+pkgver=v0.1.r0.g526cead
 pkgrel=1
 pkgdesc='helper tools for pacman local repositories'
 url='https://github.com/AladW/repoutils'
@@ -15,7 +15,7 @@ makedepends=('git')
 
 pkgver() {
     cd repoutils
-    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    git describe --long --tags | sed 's/\([^-]*-g\)/r\1/;s/-/./g'
 }
 
 package() {
